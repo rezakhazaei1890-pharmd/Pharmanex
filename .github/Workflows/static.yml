@@ -1,5 +1,5 @@
 
-name: Build, Test and Deploy PHARMANEX V2
+name: Build, Diagnose and Deploy PHARMANEX V2
 
 on:
   push:
@@ -12,23 +12,45 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: false
 
 jobs:
   test-articles:
-    name: Test Scientific Article API
+    name: Diagnose and Test Scientific Article API
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Diagnose repository structure
+        run: |
+          echo "Repository root:"
+          pwd
+
+          echo "Root files:"
+          ls -la
+
+          echo "Version2 files:"
+          ls -la version2
+
+          echo "Server files:"
+          find version2/server -maxdepth 4 -type f -print || true
+
+          echo "Checking test file:"
+          if [ -f "version2/server/tests/articles.test.js" ]; then
+            echo "TEST FILE FOUND"
+          else
+            echo "TEST FILE NOT FOUND"
+            exit 1
+          fi
 
       - name: Install dependencies
         working-directory: version2
