@@ -1,5 +1,5 @@
 
-name: Build and Deploy PHARMANEX V2
+name: Build, Test and Deploy PHARMANEX V2
 
 on:
   push:
@@ -16,12 +16,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test-articles:
+    name: Test Scientific Article API
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: version2
+        run: npm install
+
+      - name: Test real scientific article search
+        working-directory: version2
+        run: npm run test:articles
+
   build-and-deploy:
+    name: Build and Deploy Website
+    runs-on: ubuntu-latest
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
-    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -54,4 +77,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
-
