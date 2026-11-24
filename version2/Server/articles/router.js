@@ -1,20 +1,112 @@
 
 import express from "express";
+import { checkArticleLicense } from "./license.js";
 
 const router = express.Router();
 
-const TIMEOUT = 20000;
+const SOURCES = {
+  europepmc: "Europe PMC",
+  pubmed: "PubMed",
+  crossref: "Crossref",
+  openalex: "OpenAlex"
+};
 
-async function getJSON(url) {
-  const response = await fetch(url, {
-    signal: AbortSignal.timeout(TIMEOUT),
-    headers: {
-      Accept: "application/json"
+function clean(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeArticle(article) {
+  const licenseUrl = clean(article.licenseUrl);
+  const licenseLabel = clean(article.licenseLabel);
+
+  const licenseCheck = checkArticleLicense(licenseUrl);
+
+  return {
+    title: clean(article.title) || "عنوان نامشخص",
+    authors: clean(article.authors),
+    journal: clean(article.journal),
+    publicationDate: clean(article.publicationDate),
+    doi: clean(article.doi),
+    pmid: clean(article.pmid),
+    pmcid: clean(article.pmcid),
+    abstract: clean(article.abstract),
+    sourceUrl: clean(article.sourceUrl),
+    sources: article.sources || [],
+    license: {
+      url: licenseUrl || null,
+      label: licenseLabel || null,
+      verified: licenseCheck.verified,
+      allowedForCommercialTranslation: licenseCheck.allowed,
+      status: licenseCheck.allowed
+        ? "permitted"
+        : licenseCheck.verified
+          ? "restricted"
+          : "unknown",
+      reason: licenseCheck.reason
     }
+  };
+}
+
+function normalizeDoi(value) {
+  return clean(value)
+    .toLowerCase()
+    .replace(/^https?:\/\/(dx\.)?doi\.org\//, "");
+}
+
+function mergeArticles(records) {
+  const articles = new Map();
+
+  for (const raw of records) {
+    const article = normalizeArticle(raw);
+
+    const key = article.doi
+      ? `doi:${normalizeDoi(article.doi)}`
+      : article.pmid
+        ? `pmid:${article.pmid}`
+        : `title:${article.title.toLowerCase()}`;
+
+    if (!articles.has(key)) {
+      articles.set(key, article);
+      continue;
+    }
+
+    const existing = articles.get(key);
+
+    existing.sources = [
+      ...new Set([...existing.sources, ...article.sources])
+    ];
+
+    for (const field of [
+      "abstract",
+      "authors",
+      "journal",
+      "publicationDate",
+      "doi",
+      "pmid",
+      "pmcid",
+      "sourceUrl"
+    ]) {
+      if (!existing[field] && article[field]) {
+        existing[field] = article[field];
+      }
+    }
+
+    if (!existing.license.url && article.license.url) {
+      existing.license = article.license;
+    }
+  }
+
+  return [...articles.values()];
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(15000)
   });
 
   if (!response.ok) {
-    throw new Error(`Source error: ${response.status}`);
+    throw new Error(`HTTP ${response.status}`);
   }
 
   return response.json();
@@ -28,54 +120,110 @@ async function searchEuropePMC(query, limit) {
 
   url.searchParams.set("query", query);
   url.searchParams.set("format", "json");
-  url.searchParams.set("resultType", "core");
   url.searchParams.set("pageSize", String(limit));
+  url.searchParams.set("resultType", "core");
 
-  const data = await getJSON(url);
+  const data = await fetchJson(url.toString());
 
-  return (data.resultList?.result || []).map(a => ({
-    title: a.title || "",
-    authors: a.authorString || "",
-    journal: a.journalTitle || "",
-    year: a.pubYear || "",
-    doi: a.doi || "",
-    pmid: a.pmid || "",
-    pmcid: a.pmcid || "",
-    abstract: a.abstractText || "",
-    source: "Europe PMC",
-    openAccess: a.isOpenAccess === "Y",
-    url: a.pmcid
-      ? `https://europepmc.org/articles/${a.pmcid}`
-      : a.doi
-        ? `https://doi.org/${a.doi}`
-        : ""
+  return (data.resultList?.result || []).map(item => ({
+    title: item.title,
+    authors: item.authorString,
+    journal: item.journalTitle,
+    publicationDate: item.firstPublicationDate,
+    doi: item.doi,
+    pmid: item.pmid,
+    pmcid: item.pmcid,
+    abstract: item.abstractText,
+    licenseLabel: item.license,
+    sourceUrl: item.pmcid
+      ? `https://europepmc.org/articles/${item.pmcid}`
+      : item.doi
+        ? `https://doi.org/${item.doi}`
+        : null,
+    sources: [SOURCES.europepmc]
   }));
+}
+
+// PubMed
+async function searchPubMed(query, limit) {
+  const searchUrl = new URL(
+    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+  );
+
+  searchUrl.searchParams.set("db", "pubmed");
+  searchUrl.searchParams.set("term", query);
+  searchUrl.searchParams.set("retmode", "json");
+  searchUrl.searchParams.set("retmax", String(limit));
+
+  const searchData = await fetchJson(searchUrl.toString());
+  const ids = searchData.esearchresult?.idlist || [];
+
+  if (!ids.length) return [];
+
+  const summaryUrl = new URL(
+    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+  );
+
+  summaryUrl.searchParams.set("db", "pubmed");
+  summaryUrl.searchParams.set("id", ids.join(","));
+  summaryUrl.searchParams.set("retmode", "json");
+
+  const summaryData = await fetchJson(summaryUrl.toString());
+
+  return ids.map(id => {
+    const item = summaryData.result?.[id];
+    if (!item) return null;
+
+    const doiEntry = item.articleids?.find(
+      entry => entry.idtype === "doi"
+    );
+
+    return {
+      title: item.title,
+      authors: (item.authors || [])
+        .map(author => author.name)
+        .join(", "),
+      journal: item.fulljournalname || item.source,
+      publicationDate: item.pubdate,
+      doi: doiEntry?.value,
+      pmid: id,
+      sourceUrl: `https://pubmed.ncbi.nlm.nih.gov/${id}/`,
+      sources: [SOURCES.pubmed]
+    };
+  }).filter(Boolean);
 }
 
 // Crossref
 async function searchCrossref(query, limit) {
   const url = new URL("https://api.crossref.org/works");
 
-  url.searchParams.set("query.bibliographic", query);
+  url.searchParams.set("query", query);
   url.searchParams.set("rows", String(limit));
+  url.searchParams.set("select",
+    "DOI,title,author,container-title,published,URL,license");
 
-  const data = await getJSON(url);
+  const data = await fetchJson(url.toString());
 
-  return (data.message?.items || []).map(a => ({
-    title: a.title?.[0] || "",
-    authors: (a.author || [])
-      .map(x => `${x.given || ""} ${x.family || ""}`.trim())
-      .join(", "),
-    journal: a["container-title"]?.[0] || "",
-    year: a.published?.["date-parts"]?.[0]?.[0] || "",
-    doi: a.DOI || "",
-    pmid: "",
-    pmcid: "",
-    abstract: a.abstract || "",
-    source: "Crossref",
-    openAccess: Boolean(a.license?.length),
-    url: a.URL || ""
-  }));
+  return (data.message?.items || []).map(item => {
+    const licenseEntry = (item.license || []).find(
+      entry => entry.URL
+    );
+
+    return {
+      title: item.title?.[0],
+      authors: (item.author || [])
+        .map(author =>
+          [author.given, author.family].filter(Boolean).join(" ")
+        )
+        .join(", "),
+      journal: item["container-title"]?.[0],
+      publicationDate: item.published?.["date-parts"]?.[0]?.join("-"),
+      doi: item.DOI,
+      licenseUrl: licenseEntry?.URL,
+      sourceUrl: item.URL,
+      sources: [SOURCES.crossref]
+    };
+  });
 }
 
 // OpenAlex
@@ -85,168 +233,90 @@ async function searchOpenAlex(query, limit) {
   url.searchParams.set("search", query);
   url.searchParams.set("per-page", String(limit));
 
-  const data = await getJSON(url);
+  const data = await fetchJson(url.toString());
 
-  return (data.results || []).map(a => ({
-    title: a.title || "",
-    authors: (a.authorships || [])
-      .map(x => x.author?.display_name || "")
-      .filter(Boolean)
-      .join(", "),
-    journal: a.primary_location?.source?.display_name || "",
-    year: a.publication_year || "",
-    doi: (a.doi || "").replace("https://doi.org/", ""),
-    pmid: "",
-    pmcid: "",
-    abstract: "",
-    source: "OpenAlex",
-    openAccess: Boolean(a.open_access?.is_oa),
-    url: a.doi || a.id || ""
-  }));
-}
-
-// PubMed
-async function searchPubMed(query, limit) {
-  const searchURL = new URL(
-    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-  );
-
-  searchURL.searchParams.set("db", "pubmed");
-  searchURL.searchParams.set("term", query);
-  searchURL.searchParams.set("retmax", String(limit));
-  searchURL.searchParams.set("retmode", "json");
-
-  const searchData = await getJSON(searchURL);
-
-  const ids = searchData.esearchresult?.idlist || [];
-
-  if (!ids.length) return [];
-
-  const summaryURL = new URL(
-    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-  );
-
-  summaryURL.searchParams.set("db", "pubmed");
-  summaryURL.searchParams.set("id", ids.join(","));
-  summaryURL.searchParams.set("retmode", "json");
-
-  const summary = await getJSON(summaryURL);
-
-  return ids.map(id => {
-    const a = summary.result?.[id] || {};
+  return (data.results || []).map(item => {
+    const location = item.best_oa_location || {};
 
     return {
-      title: a.title || "",
-      authors: (a.authors || [])
-        .map(x => x.name)
+      title: item.title,
+      authors: (item.authorships || [])
+        .map(author =>
+          author.author?.display_name
+        )
+        .filter(Boolean)
         .join(", "),
-      journal: a.fulljournalname || a.source || "",
-      year: a.pubdate || "",
-      doi: (a.articleids || [])
-        .find(x => x.idtype === "doi")?.value || "",
-      pmid: id,
-      pmcid: "",
-      abstract: "",
-      source: "PubMed",
-      openAccess: false,
-      url: `https://pubmed.ncbi.nlm.nih.gov/${id}/`
+      journal: location.source?.display_name,
+      publicationDate: item.publication_date,
+      doi: item.doi,
+      licenseLabel: location.license,
+      sourceUrl: item.doi || item.id,
+      sources: [SOURCES.openalex]
     };
   });
 }
 
-// Remove duplicate records
-function mergeArticles(groups) {
-  const records = new Map();
-
-  for (const article of groups.flat()) {
-    const key = article.doi
-      ? `doi:${article.doi.toLowerCase()}`
-      : article.pmid
-        ? `pmid:${article.pmid}`
-        : `title:${article.title.toLowerCase().trim()}`;
-
-    if (!key || key === "title:") continue;
-
-    if (!records.has(key)) {
-      records.set(key, {
-        ...article,
-        sources: [article.source]
-      });
-    } else {
-      const existing = records.get(key);
-
-      existing.sources.push(article.source);
-
-      for (const field of [
-        "abstract",
-        "authors",
-        "journal",
-        "pmid",
-        "pmcid",
-        "url"
-      ]) {
-        if (!existing[field] && article[field]) {
-          existing[field] = article[field];
-        }
-      }
-
-      existing.openAccess =
-        existing.openAccess || article.openAccess;
-    }
-  }
-
-  return [...records.values()];
-}
-
-// Multi-source search endpoint
 router.get("/search", async (req, res) => {
-  try {
-    const query = String(req.query.q || "").trim();
+  const query = clean(req.query.q);
 
-    const limit = Math.min(
-      Math.max(Number(req.query.limit) || 10, 1),
-      20
-    );
+  const requestedLimit = Number.parseInt(req.query.limit, 10);
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.min(Math.max(requestedLimit, 1), 20)
+    : 10;
 
-    if (query.length < 3 || query.length > 200) {
-      return res.status(400).json({
-        error: "عبارت جست‌وجو باید بین ۳ تا ۲۰۰ کاراکتر باشد."
-      });
-    }
-
-    const results = await Promise.allSettled([
-      searchPubMed(query, limit),
-      searchEuropePMC(query, limit),
-      searchCrossref(query, limit),
-      searchOpenAlex(query, limit)
-    ]);
-
-    const successful = results
-      .filter(x => x.status === "fulfilled")
-      .map(x => x.value);
-
-    const articles = mergeArticles(successful);
-
-    return res.json({
-      success: true,
-      query,
-      totalResults: articles.length,
-      sources: {
-        pubmed: results[0].status === "fulfilled",
-        europePMC: results[1].status === "fulfilled",
-        crossref: results[2].status === "fulfilled",
-        openAlex: results[3].status === "fulfilled"
-      },
-      articles
-    });
-
-  } catch (error) {
-    console.error("PHARMANEX search error:", error.message);
-
-    return res.status(502).json({
-      error: "جست‌وجوی علمی فعلاً امکان‌پذیر نیست."
+  if (!query || query.length < 2 || query.length > 300) {
+    return res.status(400).json({
+      success: false,
+      error: "عبارت جست‌وجو باید بین ۲ تا ۳۰۰ نویسه باشد."
     });
   }
+
+  const tasks = [
+    ["europepmc", () => searchEuropePMC(query, limit)],
+    ["pubmed", () => searchPubMed(query, limit)],
+    ["crossref", () => searchCrossref(query, limit)],
+    ["openalex", () => searchOpenAlex(query, limit)]
+  ];
+
+  const settled = await Promise.allSettled(
+    tasks.map(([, task]) => task())
+  );
+
+  const records = [];
+  const sourceStatus = {};
+
+  settled.forEach((result, index) => {
+    const sourceKey = tasks[index][0];
+
+    if (result.status === "fulfilled") {
+      records.push(...result.value);
+      sourceStatus[sourceKey] = {
+        available: true,
+        count: result.value.length
+      };
+    } else {
+      sourceStatus[sourceKey] = {
+        available: false,
+        count: 0,
+        error: "دریافت اطلاعات از این منبع ناموفق بود."
+      };
+
+      console.error(
+        `PHARMANEX ${sourceKey} search error:`,
+        result.reason?.message
+      );
+    }
+  });
+
+  const articles = mergeArticles(records);
+
+  return res.json({
+    success: true,
+    query,
+    total: articles.length,
+    sources: sourceStatus,
+    articles
+  });
 });
 
 export default router;
